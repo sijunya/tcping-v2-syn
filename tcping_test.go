@@ -1,8 +1,10 @@
 package main
 
 import (
+	"flag"
 	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 
@@ -170,6 +172,35 @@ func TestPermuteArgs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			permuteArgs(tt.args.args)
 			assert.Equal(t, tt.want, tt.args.args)
+		})
+	}
+}
+
+func TestProcessUserInputEnablesSynMode(t *testing.T) {
+	tests := []struct {
+		name string
+		flag string
+	}{
+		{name: "syn flag", flag: "--syn"},
+		{name: "raw alias", flag: "--raw"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldArgs := os.Args
+			oldCommandLine := flag.CommandLine
+			t.Cleanup(func() {
+				os.Args = oldArgs
+				flag.CommandLine = oldCommandLine
+			})
+
+			os.Args = []string{"tcping", tt.flag, "--no-color", "127.0.0.1", "80"}
+			flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+
+			stats := &tcping{}
+			processUserInput(stats)
+
+			assert.True(t, stats.userInput.synMode)
 		})
 	}
 }

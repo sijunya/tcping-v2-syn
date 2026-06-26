@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"flag"
 	"math/rand"
 	"net"
@@ -25,6 +26,9 @@ const (
 	owner      = "pouriyajamshidi"
 	repo       = "tcping"
 	dnsTimeout = 2 * time.Second
+
+	// Linux SO_TIMESTAMPNS. The --syn probe is intended for Linux node checks.
+	soTimestampNS = 35
 )
 
 // printer is a set of methods for printers to implement.
@@ -102,6 +106,7 @@ type tcping struct {
 	rttResults                rttResult
 	destWasDown               bool // destWasDown is used to determine the duration of a downtime
 	destIsIP                  bool // destIsIP suppresses printing the IP information twice when hostname is not provided
+	synState                  *synProbeState
 }
 
 type userInput struct {
@@ -118,6 +123,7 @@ type userInput struct {
 	shouldRetryResolve       bool
 	showFailuresOnly         bool
 	showSourceAddress        bool
+	synMode                  bool
 }
 
 type genericUserInputArgs struct {
@@ -128,6 +134,8 @@ type genericUserInputArgs struct {
 	intName              *string
 	showFailuresOnly     *bool
 	showSourceAddress    *bool
+	synProbe             *bool
+	rawProbe             *bool
 	args                 []string
 }
 
@@ -135,6 +143,13 @@ type networkInterface struct {
 	remoteAddr *net.TCPAddr
 	dialer     net.Dialer
 	use        bool
+}
+
+type synProbeState struct {
+	sendFD   int
+	recvFD   int
+	srcIP    netip.Addr
+	nextPort uint16
 }
 
 type longestTime struct {
@@ -333,6 +348,8 @@ func setGenericArgs(tcping *tcping, genericArgs genericUserInputArgs) {
 	tcping.userInput.showFailuresOnly = *genericArgs.showFailuresOnly
 
 	tcping.userInput.showSourceAddress = *genericArgs.showSourceAddress
+
+	tcping.userInput.synMode = *genericArgs.synProbe || *genericArgs.rawProbe
 }
 
 // processUserInput gets and validate user input
@@ -354,6 +371,8 @@ func processUserInput(tcping *tcping) {
 	interfaceName := flag.String("I", "", "interface name or address.")
 	showSourceAddress := flag.Bool("show-source-address", false, "Show source address and port used for probes.")
 	showFailuresOnly := flag.Bool("show-failures-only", false, "Show only the failed probes.")
+	synProbe := flag.Bool("syn", false, "send raw TCP SYN probes and treat SYN-ACK or RST as a response. Requires root.")
+	rawProbe := flag.Bool("raw", false, "alias for --syn.")
 	showHelp := flag.Bool("h", false, "show help message.")
 
 	flag.CommandLine.Usage = usage
@@ -403,6 +422,8 @@ func processUserInput(tcping *tcping) {
 		intName:              interfaceName,
 		showFailuresOnly:     showFailuresOnly,
 		showSourceAddress:    showSourceAddress,
+		synProbe:             synProbe,
+		rawProbe:             rawProbe,
 		args:                 args,
 	}
 
@@ -813,6 +834,216 @@ func maxDuration(x, y time.Duration) time.Duration {
 	return y
 }
 
+func checksum(data []byte) uint16 {
+	if len(data)%2 == 1 {
+		data = append(data, 0)
+	}
+
+	sum := uint32(0)
+	for i := 0; i < len(data); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(data[i : i+2]))
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+
+	return ^uint16(sum)
+}
+
+func localIPv4For(dst netip.Addr) (netip.Addr, error) {
+	conn, err := net.Dial("udp4", net.JoinHostPort(dst.String(), "9"))
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	defer conn.Close()
+
+	addr, err := netip.ParseAddrPort(conn.LocalAddr().String())
+	if err != nil {
+		return netip.Addr{}, err
+	}
+
+	return addr.Addr(), nil
+}
+
+func synSourceIPv4(t *tcping) (netip.Addr, error) {
+	if t.userInput.networkInterface.use {
+		tcpAddr, ok := t.userInput.networkInterface.dialer.LocalAddr.(*net.TCPAddr)
+		if ok && tcpAddr.IP != nil {
+			addr, ok := netip.AddrFromSlice(tcpAddr.IP.To4())
+			if ok {
+				return addr, nil
+			}
+		}
+	}
+
+	return localIPv4For(t.userInput.ip)
+}
+
+func buildSynPacket(srcIP, dstIP netip.Addr, srcPort, dstPort uint16, seq uint32, ipID uint16) []byte {
+	packet := make([]byte, 40)
+
+	packet[0] = 0x45
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+	binary.BigEndian.PutUint16(packet[4:6], ipID)
+	packet[8] = 64
+	packet[9] = syscall.IPPROTO_TCP
+	copy(packet[12:16], srcIP.AsSlice())
+	copy(packet[16:20], dstIP.AsSlice())
+	binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:20]))
+
+	tcp := packet[20:]
+	binary.BigEndian.PutUint16(tcp[0:2], srcPort)
+	binary.BigEndian.PutUint16(tcp[2:4], dstPort)
+	binary.BigEndian.PutUint32(tcp[4:8], seq)
+	tcp[12] = 5 << 4
+	tcp[13] = 0x02
+	binary.BigEndian.PutUint16(tcp[14:16], 64240)
+
+	pseudo := make([]byte, 12+len(tcp))
+	copy(pseudo[0:4], srcIP.AsSlice())
+	copy(pseudo[4:8], dstIP.AsSlice())
+	pseudo[9] = syscall.IPPROTO_TCP
+	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(tcp)))
+	copy(pseudo[12:], tcp)
+	binary.BigEndian.PutUint16(tcp[16:18], checksum(pseudo))
+
+	return packet
+}
+
+func newSynProbeState(t *tcping) (*synProbeState, error) {
+	srcIP, err := synSourceIPv4(t)
+	if err != nil {
+		return nil, err
+	}
+
+	sendFD, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := syscall.SetsockoptInt(sendFD, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+		syscall.Close(sendFD)
+		return nil, err
+	}
+
+	recvFD, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
+	if err != nil {
+		syscall.Close(sendFD)
+		return nil, err
+	}
+	if err := syscall.SetsockoptInt(recvFD, syscall.SOL_SOCKET, soTimestampNS, 1); err != nil {
+		syscall.Close(sendFD)
+		syscall.Close(recvFD)
+		return nil, err
+	}
+
+	return &synProbeState{
+		sendFD:   sendFD,
+		recvFD:   recvFD,
+		srcIP:    srcIP,
+		nextPort: uint16(20000 + rand.Intn(40000)),
+	}, nil
+}
+
+func (s *synProbeState) close() {
+	if s == nil {
+		return
+	}
+	if s.sendFD >= 0 {
+		syscall.Close(s.sendFD)
+	}
+	if s.recvFD >= 0 {
+		syscall.Close(s.recvFD)
+	}
+}
+
+func (s *synProbeState) sourcePort() uint16 {
+	const firstEphemeral = 1024
+	const portSpan = 65535 - firstEphemeral
+
+	port := firstEphemeral + (int(s.nextPort) % portSpan)
+	s.nextPort++
+	return uint16(port)
+}
+
+func parseTCPIPv4(packet []byte) (src, dst netip.Addr, srcPort, dstPort uint16, ack uint32, flags uint8, ok bool) {
+	if len(packet) < 40 || packet[0]>>4 != 4 {
+		return src, dst, 0, 0, 0, 0, false
+	}
+
+	ihl := int(packet[0]&0x0f) * 4
+	if len(packet) < ihl+20 || packet[9] != syscall.IPPROTO_TCP {
+		return src, dst, 0, 0, 0, 0, false
+	}
+
+	src = netip.AddrFrom4([4]byte{packet[12], packet[13], packet[14], packet[15]})
+	dst = netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
+	tcp := packet[ihl:]
+
+	return src,
+		dst,
+		binary.BigEndian.Uint16(tcp[0:2]),
+		binary.BigEndian.Uint16(tcp[2:4]),
+		binary.BigEndian.Uint32(tcp[8:12]),
+		tcp[13],
+		true
+}
+
+func kernelTimestamp(oob []byte, oobn int) (time.Time, bool) {
+	messages, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	for _, message := range messages {
+		if message.Header.Level != syscall.SOL_SOCKET || message.Header.Type != soTimestampNS {
+			continue
+		}
+		if len(message.Data) < 16 {
+			return time.Time{}, false
+		}
+
+		sec := int64(binary.LittleEndian.Uint64(message.Data[0:8]))
+		nsec := int64(binary.LittleEndian.Uint64(message.Data[8:16]))
+		return time.Unix(sec, nsec), true
+	}
+
+	return time.Time{}, false
+}
+
+func waitForSynReply(fd int, deadline time.Time, srcIP, dstIP netip.Addr, srcPort, dstPort uint16, seq uint32) (time.Time, bool) {
+	buf := make([]byte, 65535)
+	oob := make([]byte, 256)
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return time.Time{}, false
+		}
+
+		tv := syscall.NsecToTimeval(left.Nanoseconds())
+		if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
+			return time.Time{}, false
+		}
+
+		size, oobn, _, _, err := syscall.Recvmsg(fd, buf, oob, 0)
+		if err != nil {
+			continue
+		}
+
+		pktSrc, pktDst, pktSrcPort, pktDstPort, ack, flags, ok := parseTCPIPv4(buf[:size])
+		if !ok {
+			continue
+		}
+		if pktSrc != dstIP || pktDst != srcIP || pktSrcPort != dstPort || pktDstPort != srcPort {
+			continue
+		}
+		if flags&0x04 != 0 || (flags&0x12 == 0x12 && ack == seq+1) {
+			if ts, ok := kernelTimestamp(oob, oobn); ok {
+				return ts, true
+			}
+			return time.Now(), true
+		}
+	}
+}
+
 // handleConnError processes failed probes
 func (t *tcping) handleConnError(connTime time.Time, elapsed time.Duration) {
 	if !t.destWasDown {
@@ -895,11 +1126,74 @@ func tcpProbe(tcping *tcping) {
 	<-tcping.ticker.C
 }
 
+// synProbe pings a host with a raw TCP SYN and stops timing on SYN-ACK or RST.
+func synProbe(tcping *tcping) {
+	connStart := time.Now()
+	if !tcping.userInput.ip.Is4() {
+		tcping.handleConnError(connStart, tcping.userInput.intervalBetweenProbes)
+		<-tcping.ticker.C
+		return
+	}
+
+	if tcping.synState == nil {
+		state, err := newSynProbeState(tcping)
+		if err != nil {
+			tcping.handleConnError(connStart, tcping.userInput.intervalBetweenProbes)
+			<-tcping.ticker.C
+			return
+		}
+		tcping.synState = state
+	}
+
+	srcIP := tcping.synState.srcIP
+	srcPort := tcping.synState.sourcePort()
+	seq := rand.Uint32()
+	packet := buildSynPacket(srcIP, tcping.userInput.ip, srcPort, tcping.userInput.port, seq, uint16(rand.Intn(65536)))
+
+	connStart = time.Now()
+	err := syscall.Sendto(tcping.synState.sendFD, packet, 0, &syscall.SockaddrInet4{
+		Port: int(tcping.userInput.port),
+		Addr: tcping.userInput.ip.As4(),
+	})
+	if err != nil {
+		tcping.handleConnError(connStart, tcping.userInput.intervalBetweenProbes)
+		<-tcping.ticker.C
+		return
+	}
+
+	replyTime, ok := waitForSynReply(
+		tcping.synState.recvFD,
+		connStart.Add(tcping.userInput.timeout),
+		srcIP,
+		tcping.userInput.ip,
+		srcPort,
+		tcping.userInput.port,
+		seq,
+	)
+	connDuration := replyTime.Sub(connStart)
+	elapsed := maxDuration(connDuration, tcping.userInput.intervalBetweenProbes)
+
+	if !ok {
+		tcping.handleConnError(connStart, elapsed)
+	} else {
+		rtt := nanoToMillisecond(connDuration.Nanoseconds())
+		sourceAddr := netip.AddrPortFrom(srcIP, srcPort).String()
+		tcping.handleConnSuccess(sourceAddr, rtt, connStart, elapsed)
+	}
+
+	<-tcping.ticker.C
+}
+
 func main() {
 	tcping := &tcping{}
 	processUserInput(tcping)
 	tcping.ticker = time.NewTicker(tcping.userInput.intervalBetweenProbes)
 	defer tcping.ticker.Stop()
+	defer func() {
+		if tcping.synState != nil {
+			tcping.synState.close()
+		}
+	}()
 
 	signalHandler(tcping)
 
@@ -914,7 +1208,11 @@ func main() {
 			retryResolveHostname(tcping)
 		}
 
-		tcpProbe(tcping)
+		if tcping.userInput.synMode {
+			synProbe(tcping)
+		} else {
+			tcpProbe(tcping)
+		}
 
 		select {
 		case pressedEnter := <-stdinchan:
